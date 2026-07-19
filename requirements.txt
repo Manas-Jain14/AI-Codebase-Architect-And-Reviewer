@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+sqlalchemy
+asyncpg
+alembic
+pydantic
+pydantic-ai
+google-genai
+python-dotenv
+streamlit
+requests
+python-multipart
