@@ -47,10 +47,17 @@ def generate_execution_flow(context: ProjectContext) -> list[dict[str, Any]]:
 
 
 def generate_database_flow(context: ProjectContext) -> dict[str, Any]:
-    """Generate database table to function relationships."""
+    """Generate a summary of the analyzed project's own detected database usage."""
+    db_files = context.database_usage.get("files", {})
+    imports_used = sorted({
+        imp for usage in db_files.values() for imp in usage.get("imports", [])
+    })
+
     return {
         "database_usage": context.database_usage,
-        "tables": ["projects", "analysis_reports", "chat_sessions", "chat_messages"],
+        "files_with_db_usage": list(db_files.keys()),
+        "imports_used": imports_used,
+        "has_database_usage": bool(db_files),
     }
 
 

@@ -27,7 +27,6 @@ class ArchitectureReview(BaseModel):
     architecture: str
     strengths: list[str] = Field(default_factory=list)
     weaknesses: list[str] = Field(default_factory=list)
-    score: float
     scalability: str
     recruiter_evaluation: str
     roadmap: list[str] = Field(default_factory=list)

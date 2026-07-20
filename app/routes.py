@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic_ai.exceptions import ModelHTTPError
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent import architect_agent, chat_agent
@@ -25,6 +26,7 @@ from app.database import AnalysisReport, ChatMessage, ChatSession, Project, get_
 from app.diagrams import (
     generate_mermaid_architecture,
     generate_mermaid_database_flow,
+    generate_mermaid_execution_flow,
     generate_mermaid_function_flow,
 )
 from app.schemas import ArchitectureReview, ChatAnswer, ProjectContext
@@ -32,6 +34,7 @@ from app.utils import build_project_context, extract_zip_safely, json_dumps, jso
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _project_extract_path(project_id: int) -> Path:
@@ -49,6 +52,28 @@ async def _load_project(session: AsyncSession, project_id: int) -> Project:
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
+
+
+async def _next_available_project_id(session: AsyncSession) -> int:
+    """Find the smallest positive integer not currently used as a project id.
+
+    This is async because it performs database I/O. The `projects.id` column is a
+    plain serial/nextval-default column (verified against the live schema), not a
+    strict GENERATED ALWAYS AS IDENTITY column, so inserting an explicit id works
+    with a normal ORM insert.
+    """
+
+    result = await session.execute(select(Project.id).order_by(Project.id))
+    existing_ids = [row[0] for row in result.all()]
+
+    candidate = 1
+    for existing_id in existing_ids:
+        if existing_id == candidate:
+            candidate += 1
+        elif existing_id > candidate:
+            break
+
+    return candidate
 
 
 async def _get_or_create_chat_session(session: AsyncSession, project_id: int) -> ChatSession:
@@ -165,7 +190,8 @@ async def upload_project(file: UploadFile = File(...), session: AsyncSession = D
     with upload_path.open("wb") as handle:
         shutil.copyfileobj(file.file, handle)
 
-    project = Project(project_name=Path(file.filename).stem, zip_path=str(upload_path))
+    next_id = await _next_available_project_id(session)
+    project = Project(id=next_id, project_name=Path(file.filename).stem, zip_path=str(upload_path))
     session.add(project)
     await session.commit()
     await session.refresh(project)
@@ -189,6 +215,53 @@ async def list_projects(session: AsyncSession = Depends(get_session)):
         {"id": project.id, "project_name": project.project_name, "zip_path": project.zip_path, "created_at": project.created_at}
         for project in projects
     ]
+
+
+@router.delete("/projects/{project_id}")
+async def delete_project(project_id: int, session: AsyncSession = Depends(get_session)):
+    """Delete a project and all of its associated data (DB rows, zip, extracted folder).
+
+    This is async because it performs database and filesystem I/O.
+    """
+
+    project = await _load_project(session, project_id)
+
+    session_ids_subquery = select(ChatSession.id).where(ChatSession.project_id == project_id).scalar_subquery()
+    await session.execute(delete(ChatMessage).where(ChatMessage.session_id.in_(session_ids_subquery)))
+    await session.execute(delete(ChatSession).where(ChatSession.project_id == project_id))
+    await session.execute(delete(AnalysisReport).where(AnalysisReport.project_id == project_id))
+    await session.execute(delete(Project).where(Project.id == project_id))
+    await session.commit()
+
+    zip_path = Path(project.zip_path)
+    if zip_path.exists():
+        try:
+            zip_path.unlink()
+        except OSError:
+            logger.exception("Failed to delete zip file %s for project %s", zip_path, project_id)
+
+    extract_path = _project_extract_path(project_id)
+    if extract_path.exists():
+        try:
+            shutil.rmtree(extract_path)
+        except OSError:
+            logger.exception(
+                "Failed to remove extracted folder %s for project %s; id %s may not be safe to "
+                "reuse until this folder is cleared manually",
+                extract_path,
+                project_id,
+                project_id,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Project {project_id} was deleted from the database, but its extracted "
+                    "folder could not be fully removed. Clear it manually before reusing this "
+                    "project id, or contamination from this project may leak into a future upload."
+                ),
+            ) from None
+
+    return {"deleted": True, "project_id": project_id}
 
 
 @router.get("/analysis/{project_id}")
@@ -217,7 +290,7 @@ async def analyze_project(project_id: int, session: AsyncSession = Depends(get_s
         architecture=review.architecture,
         strengths=json_dumps(review.strengths),
         weaknesses=json_dumps(review.weaknesses),
-        score=review.score,
+        score=0.0,  # dummy value only to satisfy the DB's NOT NULL constraint; never read or displayed
         roadmap=json_dumps(review.roadmap),
     )
     session.add(report)
@@ -231,7 +304,6 @@ async def analyze_project(project_id: int, session: AsyncSession = Depends(get_s
         "architecture": report.architecture,
         "strengths": review.strengths,
         "weaknesses": review.weaknesses,
-        "score": report.score,
         "roadmap": review.roadmap,
         "scalability": review.scalability,
         "recruiter_evaluation": review.recruiter_evaluation,
@@ -257,7 +329,6 @@ async def get_report(project_id: int, session: AsyncSession = Depends(get_sessio
         "architecture": report.architecture,
         "strengths": json_loads(report.strengths, []),
         "weaknesses": json_loads(report.weaknesses, []),
-        "score": report.score,
         "roadmap": json_loads(report.roadmap, []),
     }
 
@@ -294,6 +365,7 @@ async def get_architecture(project_id: int, session: AsyncSession = Depends(get_
         "mermaid_architecture": generate_mermaid_architecture(project_context),
         "mermaid_function_flow": generate_mermaid_function_flow(project_context),
         "mermaid_database_flow": generate_mermaid_database_flow(project_context),
+        "mermaid_execution_flow": generate_mermaid_execution_flow(project_context),
         "python_files": project_context.python_files,
         "functions": project_context.functions,
         "classes": project_context.classes,

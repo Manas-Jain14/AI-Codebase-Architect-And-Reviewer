@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import html
 import os
+import re
 from pathlib import Path
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
@@ -56,15 +59,22 @@ def upload_zip(file_path: Path) -> dict:
     return response.json()
 
 
+def delete_project(project_id: int) -> dict:
+    response = requests.delete(f"{BACKEND_URL}/projects/{project_id}", timeout=60)
+    response.raise_for_status()
+    return response.json()
+
+
+def _clean_project_label(name: str) -> str:
+    """Strip trailing OS-duplicate-style suffixes like ' (1)' or ' (1) (2)' for display only."""
+    return re.sub(r"(\s\(\d+\))+$", "", name)
+
+
 st.set_page_config(page_title="AI Codebase Architect", layout="wide")
 st.title("🏗️ AI Codebase Architect & Engineering Reviewer")
 
 if "messages" not in st.session_state:
     st.session_state.messages = {}
-if "selected_file" not in st.session_state:
-    st.session_state.selected_file = None
-if "selected_function" not in st.session_state:
-    st.session_state.selected_function = None
 
 sidebar_projects = []
 try:
@@ -73,13 +83,36 @@ except Exception:
     st.sidebar.warning("Backend is not reachable yet.")
 
 st.sidebar.header("📂 Project List")
-project_labels = [f"{project['id']}: {project['project_name']}" for project in sidebar_projects]
+project_labels = [f"{project['id']}: {_clean_project_label(project['project_name'])}" for project in sidebar_projects]
 selected_label = st.sidebar.selectbox("Project Selection", [""] + project_labels)
 
 selected_project = None
 if selected_label:
     selected_id = int(selected_label.split(":")[0])
     selected_project = next((project for project in sidebar_projects if project["id"] == selected_id), None)
+
+if selected_project is not None:
+    delete_confirm_key = f"confirm_delete_{selected_project['id']}"
+    if not st.session_state.get(delete_confirm_key):
+        if st.sidebar.button("🗑️ Delete selected project"):
+            st.session_state[delete_confirm_key] = True
+            st.rerun()
+    else:
+        st.sidebar.warning("Are you sure? This removes all analysis and chat history for this project.")
+        confirm_col, cancel_col = st.sidebar.columns(2)
+        with confirm_col:
+            if st.button("✅ Confirm", key=f"confirm_delete_btn_{selected_project['id']}"):
+                try:
+                    delete_project(selected_project["id"])
+                    st.session_state.messages.pop(selected_project["id"], None)
+                    st.session_state.pop(delete_confirm_key, None)
+                    st.rerun()
+                except Exception as e:
+                    st.sidebar.error(f"Delete failed: {e}")
+        with cancel_col:
+            if st.button("❌ Cancel", key=f"cancel_delete_btn_{selected_project['id']}"):
+                st.session_state.pop(delete_confirm_key, None)
+                st.rerun()
 
 tab_analysis, tab_architect, tab_report, tab_chat, tab_upload = st.tabs([
     "📊 Analysis",
@@ -117,6 +150,130 @@ with tab_analysis:
             st.error(f"Analysis failed: {e}")
 
 with tab_architect:
+    def render_mermaid(diagram_code: str, height: int = 750) -> None:
+        """Render Mermaid diagram source as an interactive, theme-aware SVG.
+
+        Mermaid's default useMaxWidth behavior caps the SVG at its own natural
+        (often small) rendered size, which is why diagrams used to show up tiny
+        inside a mostly-empty container. useMaxWidth is disabled here and a custom
+        fit-to-container scale is computed after render instead, so the default
+        view already fills the available space and is readable without zooming.
+        """
+        escaped_code = html.escape(diagram_code)
+        component_html = f"""
+        <div id="mermaid-outer" style="width:100%; height:{height}px; position:relative;
+             border:1px solid rgba(128,128,128,0.25); border-radius:8px; overflow:hidden; background:transparent;">
+            <div style="position:absolute; top:8px; right:8px; z-index:10; display:flex; gap:6px;">
+                <button id="mermaid-zoom-in" title="Zoom in"
+                    style="cursor:pointer; border:1px solid rgba(128,128,128,0.4); background:rgba(128,128,128,0.12);
+                    color:inherit; border-radius:4px; padding:3px 8px; font-size:13px;">+</button>
+                <button id="mermaid-zoom-out" title="Zoom out"
+                    style="cursor:pointer; border:1px solid rgba(128,128,128,0.4); background:rgba(128,128,128,0.12);
+                    color:inherit; border-radius:4px; padding:3px 8px; font-size:13px;">-</button>
+                <button id="mermaid-reset" title="Fit to screen"
+                    style="cursor:pointer; border:1px solid rgba(128,128,128,0.4); background:rgba(128,128,128,0.12);
+                    color:inherit; border-radius:4px; padding:3px 8px; font-size:12px;">Fit</button>
+            </div>
+            <div id="mermaid-viewport" style="width:100%; height:100%; overflow:hidden; cursor:grab;">
+                <div id="mermaid-pan" style="transform-origin: 0 0; width:fit-content; padding:16px;">
+                    <div id="mermaid-target" class="mermaid">{escaped_code}</div>
+                </div>
+            </div>
+        </div>
+        <style>
+            html, body {{ background: transparent; margin: 0; }}
+            #mermaid-target svg {{ max-width: none !important; }}
+        </style>
+        <script type="module">
+            import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs";
+
+            const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+            mermaid.initialize({{
+                startOnLoad: false,
+                theme: prefersDark ? "dark" : "default",
+                securityLevel: "loose",
+                themeVariables: {{ fontSize: "18px" }},
+                flowchart: {{ useMaxWidth: false, curve: "linear", rankSpacing: 70, nodeSpacing: 45 }},
+                sequence: {{ useMaxWidth: false, actorFontSize: 16, messageFontSize: 15, noteFontSize: 14 }},
+            }});
+
+            const viewport = document.getElementById("mermaid-viewport");
+            const pan = document.getElementById("mermaid-pan");
+            const target = document.getElementById("mermaid-target");
+
+            let scale = 1;
+            let originX = 0;
+            let originY = 0;
+            let isPanning = false;
+            let startX = 0;
+            let startY = 0;
+
+            function applyTransform() {{
+                pan.style.transform = `translate(${{originX}}px, ${{originY}}px) scale(${{scale}})`;
+            }}
+
+            function computeFitScale() {{
+                const svg = target.querySelector("svg");
+                if (!svg) return 1;
+                const box = svg.getBBox ? svg.getBBox() : null;
+                const naturalWidth = (box && box.width) || svg.getBoundingClientRect().width || 1;
+                const naturalHeight = (box && box.height) || svg.getBoundingClientRect().height || 1;
+                const availableWidth = Math.max(viewport.clientWidth - 32, 50);
+                const availableHeight = Math.max(viewport.clientHeight - 32, 50);
+                const fitScale = Math.min(availableWidth / naturalWidth, availableHeight / naturalHeight);
+                return Math.max(0.4, Math.min(fitScale, 2.5));
+            }}
+
+            function resetView() {{
+                scale = computeFitScale();
+                originX = 0;
+                originY = 0;
+                applyTransform();
+            }}
+
+            mermaid.run({{ nodes: [target] }}).then(resetView).catch(() => {{
+                target.innerText = "Failed to render diagram.";
+            }});
+
+            viewport.addEventListener("wheel", (event) => {{
+                event.preventDefault();
+                const delta = event.deltaY < 0 ? 0.1 : -0.1;
+                scale = Math.min(4, Math.max(0.2, scale + delta));
+                applyTransform();
+            }}, {{ passive: false }});
+
+            viewport.addEventListener("mousedown", (event) => {{
+                isPanning = true;
+                startX = event.clientX - originX;
+                startY = event.clientY - originY;
+                viewport.style.cursor = "grabbing";
+            }});
+
+            window.addEventListener("mouseup", () => {{
+                isPanning = false;
+                viewport.style.cursor = "grab";
+            }});
+
+            window.addEventListener("mousemove", (event) => {{
+                if (!isPanning) return;
+                originX = event.clientX - startX;
+                originY = event.clientY - startY;
+                applyTransform();
+            }});
+
+            document.getElementById("mermaid-zoom-in").addEventListener("click", () => {{
+                scale = Math.min(4, scale + 0.2);
+                applyTransform();
+            }});
+            document.getElementById("mermaid-zoom-out").addEventListener("click", () => {{
+                scale = Math.max(0.2, scale - 0.2);
+                applyTransform();
+            }});
+            document.getElementById("mermaid-reset").addEventListener("click", resetView);
+        </script>
+        """
+        components.html(component_html, height=height, scrolling=False)
+
     if selected_project is None:
         st.info("📌 Select a project to explore its architecture.")
     else:
@@ -147,232 +304,34 @@ with tab_architect:
                     st.metric("🌐 Routes", metrics["api_routes"])
 
                 # ============================================================
-                # SECTION 2 & 3: PROJECT TREE & FILE DEPENDENCY EXPLORER
+                # SECTION 2: ARCHITECTURE DIAGRAMS (main focus of the tab)
                 # ============================================================
-                col_tree, col_deps = st.columns(2)
-
-                with col_tree:
-                    st.subheader("🌳 Project Structure")
-                    python_files = arch_data.get("python_files", [])
-                    selected_file = st.selectbox(
-                        "Select a file to inspect",
-                        python_files,
-                        key="file_selector"
+                st.subheader("📐 Architecture Diagrams")
+                diagram_options = {
+                    "How Files Connect": "mermaid_architecture",
+                    "How Functions Call Each Other": "mermaid_function_flow",
+                    "Database Usage": "mermaid_database_flow",
+                    "Step-by-Step Flow": "mermaid_execution_flow",
+                }
+                selected_diagram_label = st.radio(
+                    "Diagram type",
+                    list(diagram_options.keys()),
+                    horizontal=True,
+                    key="architecture_diagram_selector",
+                )
+                if selected_diagram_label == "How Files Connect":
+                    st.caption("Files at the top are used by files below them — follow the arrows downward.")
+                elif selected_diagram_label == "How Functions Call Each Other":
+                    st.caption(
+                        "A more detailed, advanced view. It can look sparse or empty for "
+                        "projects that mostly call UI widgets or library functions instead "
+                        "of their own — that's expected, not a bug."
                     )
-                    if selected_file:
-                        st.session_state.selected_file = selected_file
-
-                with col_deps:
-                    st.subheader("📚 File Dependencies")
-                    dep_graph = arch_data.get("dependency_graph", {})
-                    if selected_file and selected_file in dep_graph.get("files", {}):
-                        deps = dep_graph["files"].get(selected_file, [])
-                        if deps:
-                            for dep in deps[:10]:
-                                st.write(f"→ {dep}")
-                        else:
-                            st.write(f"No dependencies")
-                    else:
-                        st.write("Select a file to see dependencies")
-
-                # ============================================================
-                # SECTION 4: FILE INSPECTOR
-                # ============================================================
-                if st.session_state.selected_file:
-                    st.subheader(f"📝 File Inspector: {st.session_state.selected_file}")
-                    inspector_tabs = st.tabs(["Details", "Functions", "Classes", "Imports", "Routes", "Database"])
-
-                    # Get file details via API if available
-                    try:
-                        file_details = requests.get(
-                            f"{BACKEND_URL}/architecture/{selected_project['id']}/file/{st.session_state.selected_file}",
-                            timeout=30
-                        ).json()
-
-                        with inspector_tabs[0]:  # Details
-                            st.write(f"**File**: {file_details.get('file')}")
-                            if file_details.get('imported_by'):
-                                st.write("**Imported by:**")
-                                for importer in file_details['imported_by']:
-                                    st.write(f"  ← {importer}")
-
-                        with inspector_tabs[1]:  # Functions
-                            if file_details.get('functions'):
-                                for func in file_details['functions']:
-                                    st.write(f"🔧 **{func['name']}** (line {func['line']})")
-                            else:
-                                st.write("No functions")
-
-                        with inspector_tabs[2]:  # Classes
-                            if file_details.get('classes'):
-                                for cls in file_details['classes']:
-                                    st.write(f"📦 **{cls['name']}** (line {cls['line']})")
-                                    if cls['methods']:
-                                        for method in cls['methods']:
-                                            st.write(f"  → {method}")
-                            else:
-                                st.write("No classes")
-
-                        with inspector_tabs[3]:  # Imports
-                            if file_details.get('imports'):
-                                for imp in file_details['imports']:
-                                    st.write(f"📌 {imp.get('name')}")
-                            else:
-                                st.write("No imports")
-
-                        with inspector_tabs[4]:  # Routes
-                            if file_details.get('api_routes'):
-                                for route in file_details['api_routes']:
-                                    st.write(f"🌐 {', '.join(route['methods'])} {route['path']}")
-                            else:
-                                st.write("No API routes")
-
-                        with inspector_tabs[5]:  # Database
-                            if file_details.get('database_usage'):
-                                db_usage = file_details['database_usage']
-                                if db_usage.get('imports'):
-                                    st.write("**DB Imports:**")
-                                    for imp in db_usage['imports']:
-                                        st.write(f"  → {imp}")
-                                if db_usage.get('operations'):
-                                    st.write("**DB Operations:**")
-                                    for op in db_usage['operations']:
-                                        st.write(f"  → {op['name']} (line {op['line']})")
-                            else:
-                                st.write("No database usage")
-
-                    except Exception as e:
-                        st.write(f"Could not load file details: {e}")
-
-                # ============================================================
-                # SECTION 5 & 6: FUNCTION EXPLORER & FLOW VIEWER
-                # ============================================================
-                col_func, col_flow = st.columns(2)
-
-                with col_func:
-                    st.subheader("⚙️ Function Explorer")
-                    functions = arch_data.get("functions", [])
-                    func_names = [f["name"] for f in functions]
-                    selected_func = st.selectbox(
-                        "Select a function",
-                        func_names,
-                        key="func_selector"
-                    )
-
-                    if selected_func:
-                        st.session_state.selected_function = selected_func
-                        try:
-                            func_details = requests.get(
-                                f"{BACKEND_URL}/architecture/{selected_project['id']}/function/{selected_func}",
-                                timeout=30
-                            ).json()
-
-                            st.write(f"**File**: {func_details.get('file')}")
-                            st.write(f"**Line**: {func_details.get('line')}")
-                            if func_details.get('is_async'):
-                                st.write("🔄 **Async Function**")
-                            if func_details.get('parameters'):
-                                st.write(f"**Parameters**: {', '.join(func_details['parameters'])}")
-
-                        except Exception as e:
-                            st.write(f"Could not load function details: {e}")
-
-                with col_flow:
-                    st.subheader("🔄 Function Flow")
-                    if st.session_state.selected_function:
-                        func_graph = arch_data.get("function_graph", {})
-                        calls = func_graph.get("function_calls", {}).get(st.session_state.selected_function, [])
-                        if calls:
-                            st.write(f"**{st.session_state.selected_function}** calls:")
-                            for called_func in calls[:5]:
-                                st.write(f"  ↓ {called_func}")
-                        else:
-                            st.write(f"**{st.session_state.selected_function}** has no function calls")
-
-                # ============================================================
-                # SECTION 7: API FLOW EXPLORER
-                # ============================================================
-                st.subheader("🌐 API Flow")
-                execution_flows = arch_data.get("execution_flow", [])
-                if execution_flows:
-                    for flow in execution_flows[:5]:
-                        with st.expander(f"{' | '.join(flow['methods'])} {flow['route']}"):
-                            st.write(f"**Handler**: {flow['handler']}")
-                            if flow['calls']:
-                                st.write("**Calls:**")
-                                for called in flow['calls'][:5]:
-                                    st.write(f"  → {called}")
+                selected_diagram_code = arch_data.get(diagram_options[selected_diagram_label])
+                if selected_diagram_code:
+                    render_mermaid(selected_diagram_code)
                 else:
-                    st.write("No API routes found")
-
-                # ============================================================
-                # SECTION 8: DATABASE FLOW
-                # ============================================================
-                st.subheader("🗄️ Database Flow")
-                db_flow = arch_data.get("database_flow", {})
-                st.write("**Tables:**")
-                for table in db_flow.get("tables", []):
-                    st.write(f"  📊 {table}")
-
-                # ============================================================
-                # SECTION 9: MERMAID ARCHITECTURE
-                # ============================================================
-                st.subheader("📐 Architecture Diagram")
-                mermaid_arch = arch_data.get("mermaid_architecture")
-                if mermaid_arch:
-                    st.code(mermaid_arch, language="mermaid")
-
-                # ============================================================
-                # SECTION 10: CRITICAL FILES
-                # ============================================================
-                st.subheader("⭐ Critical Files")
-                critical = arch_data.get("critical_files", {})
-                col_crit1, col_crit2, col_crit3 = st.columns(3)
-                with col_crit1:
-                    st.write("**Entry Point:**")
-                    for f in critical.get("entry_point", []):
-                        st.write(f"  🚀 {f}")
-                    st.write("**API Layer:**")
-                    for f in critical.get("api_layer", []):
-                        st.write(f"  🌐 {f}")
-                with col_crit2:
-                    st.write("**Database Layer:**")
-                    for f in critical.get("database_layer", []):
-                        st.write(f"  🗄️ {f}")
-                    st.write("**AI Layer:**")
-                    for f in critical.get("ai_layer", []):
-                        st.write(f"  🤖 {f}")
-                with col_crit3:
-                    st.write("**Analysis Layer:**")
-                    for f in critical.get("analysis_layer", []):
-                        st.write(f"  📊 {f}")
-
-                # ============================================================
-                # SECTION 11: EXECUTION PATH EXPLORER
-                # ============================================================
-                st.subheader("🎯 Execution Paths")
-                st.write("**Analysis Flow:**")
-                st.write("""
-                User Clicks Analyze
-                        ↓
-                GET /analysis/{id}
-                        ↓
-                routes.py → analyze_project()
-                        ↓
-                app/analyzers.py → build_context()
-                        ↓
-                ProjectContext (AST Analysis)
-                        ↓
-                app/agent.py → architect_agent.run()
-                        ↓
-                Gemini API
-                        ↓
-                ArchitectureReview
-                        ↓
-                app/database.py → save_report()
-                        ↓
-                PostgreSQL
-                """)
+                    st.info("No diagram available for this selection.")
 
         except Exception as e:
             st.error(f"Failed to load architecture: {e}")
@@ -398,8 +357,6 @@ with tab_report:
                 with st.expander("Weaknesses"):
                     for item in report["weaknesses"]:
                         st.write(f"- {item}")
-                st.subheader("Score")
-                st.write(report["score"])
                 st.subheader("Roadmap")
                 with st.expander("Roadmap"):
                     for item in report["roadmap"]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import datetime as dt
 import os
+import shutil
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -28,10 +29,19 @@ DATABASE_IMPORT_PREFIXES = (
 
 
 def safe_extract_zip(zip_path: str | Path, destination_dir: str | Path) -> Path:
-    """Extract a ZIP file safely into a destination directory."""
+    """Extract a ZIP file safely into a destination directory.
+
+    destination_dir is fully wiped first if it already exists, so extraction
+    always starts from an empty folder. Without this, a project id that gets
+    reused after its predecessor was deleted would inherit any leftover files
+    from that predecessor (e.g. if their cleanup failed) and silently mix them
+    into the new project's file tree.
+    """
 
     zip_path = Path(zip_path)
     destination_dir = Path(destination_dir)
+    if destination_dir.exists():
+        shutil.rmtree(destination_dir)
     destination_dir.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(zip_path) as archive:
@@ -321,11 +331,34 @@ def analyze_function_calls(project_root: str | Path) -> dict[str, Any]:
     }
 
 
+def _resolve_effective_project_root(project_root: Path) -> Path:
+    """Unwrap nested single-directory wrappers before analysis.
+
+    A zip whose contents all sit under one top-level folder (e.g.
+    extracted_projects/{id}/some-repo-name/app/...) would otherwise have its module
+    index keyed with that wrapper folder name (e.g. "some-repo-name.app.database"),
+    which the project's own unprefixed imports (e.g. "from app.database import ...")
+    never match — producing a fully empty dependency graph. Repeats in case of
+    multiple nested wrapper levels, stopping as soon as the current root contains
+    anything other than exactly one directory.
+    """
+
+    effective_root = project_root
+    while True:
+        entries = list(effective_root.iterdir())
+        if len(entries) != 1 or not entries[0].is_dir():
+            break
+        effective_root = entries[0]
+
+    return effective_root
+
+
 def build_context(project_root: str | Path, project_name: str | None = None) -> dict[str, Any]:
     project_root = Path(project_root)
-    structure = analyze_structure(project_root)
-    import_info = analyze_imports(project_root)
-    function_call_info = analyze_function_calls(project_root)
+    effective_root = _resolve_effective_project_root(project_root)
+    structure = analyze_structure(effective_root)
+    import_info = analyze_imports(effective_root)
+    function_call_info = analyze_function_calls(effective_root)
 
     context = {
         "project_name": project_name or project_root.name,
@@ -335,11 +368,11 @@ def build_context(project_root: str | Path, project_name: str | None = None) -> 
         "python_files": structure["python_files"],
         "imports": import_info["imports"],
         "dependency_graph": import_info["dependency_graph"],
-        "functions": analyze_functions(project_root),
-        "classes": analyze_classes(project_root),
-        "api_routes": analyze_api_routes(project_root),
-        "database_usage": analyze_database_usage(project_root),
-        "entry_points": analyze_entrypoints(project_root),
+        "functions": analyze_functions(effective_root),
+        "classes": analyze_classes(effective_root),
+        "api_routes": analyze_api_routes(effective_root),
+        "database_usage": analyze_database_usage(effective_root),
+        "entry_points": analyze_entrypoints(effective_root),
         "function_calls": function_call_info["function_calls"],
         "analysis_timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
