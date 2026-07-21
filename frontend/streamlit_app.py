@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 from pathlib import Path
+from typing import Iterator
 
 import requests
 import streamlit as st
@@ -41,14 +43,46 @@ def trigger_analysis(project_id: int) -> dict:
     return response.json()
 
 
-def send_chat(project_id: int, question: str) -> dict:
+def stream_chat(project_id: int, question: str, result: dict) -> Iterator[str]:
+    """Stream a chat answer as SSE text chunks for st.write_stream().
+
+    Terminal event data (referenced_files, or an interruption message) is stashed
+    into `result` as a side effect, since it arrives only after the last text chunk
+    and st.write_stream() only collects the yielded chunks themselves.
+    """
     response = requests.post(
-        f"{BACKEND_URL}/chat/{project_id}",
+        f"{BACKEND_URL}/chat/{project_id}/stream",
         json={"question": question},
+        stream=True,
         timeout=300,
     )
     response.raise_for_status()
-    return response.json()
+
+    event_name = None
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if raw_line is None:
+            continue
+        line = raw_line.strip()
+        if not line:
+            event_name = None
+            continue
+        if line.startswith("event:"):
+            event_name = line[len("event:"):].strip()
+            continue
+        if not line.startswith("data:"):
+            continue
+
+        try:
+            payload = json.loads(line[len("data:"):].strip())
+        except json.JSONDecodeError:
+            continue
+
+        if event_name == "done":
+            result["referenced_files"] = payload.get("referenced_files", [])
+        elif event_name == "error":
+            result["error"] = payload.get("message", "The response was interrupted.")
+        elif "chunk" in payload:
+            yield payload["chunk"]
 
 
 def upload_zip(file_path: Path) -> dict:
@@ -383,14 +417,17 @@ with tab_chat:
                 with st.chat_message("user"):
                     st.write(prompt)
 
-                with st.spinner("Thinking..."):
-                    answer = send_chat(project_id, prompt)
-                st.session_state.messages[project_id].append({"role": "assistant", "content": answer["answer"]})
                 with st.chat_message("assistant"):
-                    st.write(answer["answer"])
-                    st.write("Referenced Files:")
-                    for file_name in answer.get("referenced_files", []):
-                        st.write(f"- {file_name}")
+                    stream_result: dict = {}
+                    full_answer = st.write_stream(stream_chat(project_id, prompt, stream_result))
+                    if stream_result.get("error"):
+                        st.warning(stream_result["error"])
+                    referenced_files = stream_result.get("referenced_files", [])
+                    if referenced_files:
+                        st.write("Referenced Files:")
+                        for file_name in referenced_files:
+                            st.write(f"- {file_name}")
+                st.session_state.messages[project_id].append({"role": "assistant", "content": full_answer})
         except Exception as e:
             st.error(f"Chat failed: {e}")
 

@@ -125,22 +125,36 @@ architect_agent = Agent(
     ],
 )
 
+_CHAT_SYSTEM_PROMPT = (
+    "You answer questions about a codebase using only ProjectContext and tools. "
+    "Never access the filesystem or raw source code directly. "
+    "Be precise and concise."
+)
+_CHAT_TOOLS = [
+    get_project_structure,
+    get_dependency_graph,
+    get_function_flow,
+    get_api_routes,
+    get_database_info,
+    get_project_metrics,
+    generate_mermaid,
+]
+
 chat_agent = Agent(
     shared_model,
     deps_type=ProjectContext,
     output_type=ChatAnswer,
-    system_prompt=(
-        "You answer questions about a codebase using only ProjectContext and tools. "
-        "Never access the filesystem or raw source code directly. "
-        "Be precise and concise."
-    ),
-    tools=[
-        get_project_structure,
-        get_dependency_graph,
-        get_function_flow,
-        get_api_routes,
-        get_database_info,
-        get_project_metrics,
-        generate_mermaid,
-    ],
+    system_prompt=_CHAT_SYSTEM_PROMPT,
+    tools=_CHAT_TOOLS,
+)
+
+# Plain-text variant used for token-by-token streaming. Gemini's structured
+# (JSON-mode) output for ChatAnswer only arrives in one or two large chunks even
+# under stream_output(), so it can't drive a real word-by-word UI; a plain-text
+# output_type streams in genuine incremental deltas via stream_text(delta=True).
+chat_agent_stream = Agent(
+    shared_model,
+    deps_type=ProjectContext,
+    system_prompt=_CHAT_SYSTEM_PROMPT,
+    tools=_CHAT_TOOLS,
 )

@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import logging
 import re
 import shutil
 from pathlib import Path
+from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from pydantic_ai.exceptions import ModelHTTPError
+from fastapi.responses import StreamingResponse
+from pydantic_ai.exceptions import AgentRunError, ModelHTTPError, UnexpectedModelBehavior
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent import architect_agent, chat_agent
+from app.agent import architect_agent, chat_agent, chat_agent_stream
 from app.architecture import (
     generate_database_flow,
     generate_dependency_graph,
@@ -76,6 +79,34 @@ async def _next_available_project_id(session: AsyncSession) -> int:
     return candidate
 
 
+async def _build_chat_prompt(session: AsyncSession, chat_session: ChatSession, question: str) -> str:
+    """Assemble the model prompt from prior chat history plus the current question.
+
+    This is async because it performs database I/O.
+    """
+
+    history_result = await session.execute(
+        select(ChatMessage)
+        .where(ChatMessage.session_id == chat_session.id)
+        .order_by(ChatMessage.created_at.asc())
+    )
+    history_messages = history_result.scalars().all()
+
+    history_text: list[str] = []
+    for message in history_messages:
+        history_text.append(f"User: {message.question}")
+        history_text.append(f"Assistant: {message.answer}")
+
+    return "\n".join(
+        [
+            "Chat history:",
+            *history_text,
+            "Current question:",
+            question,
+        ]
+    )
+
+
 async def _get_or_create_chat_session(session: AsyncSession, project_id: int) -> ChatSession:
     """Load or create the chat session for a project.
 
@@ -95,7 +126,11 @@ async def _get_or_create_chat_session(session: AsyncSession, project_id: int) ->
 
 
 async def _run_chat_agent_with_retry(prompt: str, project_context: ProjectContext) -> ChatAnswer:
-    """Run the chat agent and retry once if Gemini rate-limits the request.
+    """Run the chat agent and retry if Gemini rate-limits the request.
+
+    Any other agent failure (a non-429 HTTP error, the model producing output that
+    fails validation, or anything else unexpected) degrades to _build_chat_fallback()
+    instead of raising, so a raw error never reaches the client.
 
     This is async because the model call and retry delay are both non-blocking I/O.
     """
@@ -110,14 +145,18 @@ async def _run_chat_agent_with_retry(prompt: str, project_context: ProjectContex
             )
             return result.output
         except ModelHTTPError as error:
-            if error.status_code != 429:
-                raise
-
-            if attempt == max_attempts:
-                return _build_chat_fallback(project_context, prompt)
-
-            retry_delay = _extract_retry_delay_seconds(error) or 6.0
-            await asyncio.sleep(retry_delay)
+            if error.status_code == 429 and attempt < max_attempts:
+                retry_delay = _extract_retry_delay_seconds(error) or 6.0
+                await asyncio.sleep(retry_delay)
+                continue
+            logger.exception("Chat model call failed with an HTTP error")
+            return _build_chat_fallback(project_context, prompt)
+        except (UnexpectedModelBehavior, AgentRunError):
+            logger.exception("Chat agent misbehaved")
+            return _build_chat_fallback(project_context, prompt)
+        except Exception:
+            logger.exception("Unexpected error while running the chat agent")
+            return _build_chat_fallback(project_context, prompt)
 
     # Fallback after exhausting all retries (should not be reached due to loop logic)
     return _build_chat_fallback(project_context, prompt)
@@ -144,6 +183,25 @@ def _extract_retry_delay_seconds(error: ModelHTTPError) -> float | None:
     return None
 
 
+_FALLBACK_KEYWORDS = ("architecture", "entry", "route", "database")
+
+
+def _match_fallback_keyword(question: str) -> str | None:
+    """Fuzzy-match the words in a question against the fallback's trigger keywords,
+    so a misspelling like "databse" still routes to the right canned answer instead
+    of falling through to the generic one. Only used on this degraded fallback path
+    — normal Gemini-backed answers already handle typos fine on their own since
+    it's a real LLM understanding natural language.
+    """
+
+    for word in re.findall(r"[a-z]+", question.lower()):
+        matches = difflib.get_close_matches(word, _FALLBACK_KEYWORDS, n=1, cutoff=0.75)
+        if matches:
+            return matches[0]
+
+    return None
+
+
 def _build_chat_fallback(project_context: object, prompt: str) -> ChatAnswer:
     """Build a deterministic answer when Gemini is unavailable.
 
@@ -156,16 +214,18 @@ def _build_chat_fallback(project_context: object, prompt: str) -> ChatAnswer:
     if not referenced_files:
         referenced_files = list(getattr(context, "imports", {}).keys())[:5]
 
-    if "architecture" in question:
+    matched_keyword = _match_fallback_keyword(question)
+
+    if matched_keyword == "architecture":
         answer = (
             "The project is a very small root-level Python codebase with a flat structure. "
             "It currently contains a minimal file tree, no layered package architecture, and only placeholder-style files."
         )
-    elif "entry" in question:
+    elif matched_keyword == "entry":
         answer = "The most likely entry point is main.py, with app.py also acting as a bootstrap or application file."
-    elif "route" in question:
+    elif matched_keyword == "route":
         answer = "No API routes were discovered in the uploaded sample project."
-    elif "database" in question:
+    elif matched_keyword == "database":
         answer = "No database usage was discovered in the uploaded sample project."
     else:
         answer = "I could not reach Gemini due to rate limits, so this is a context-based fallback answer."
@@ -423,28 +483,9 @@ async def chat_with_project(project_id: int, payload: dict, session: AsyncSessio
 
     project_context = build_project_context(project.project_name, project_root)
     chat_session = await _get_or_create_chat_session(session, project.id)
+    prompt = await _build_chat_prompt(session, chat_session, question)
 
-    history_result = await session.execute(
-        select(ChatMessage)
-        .where(ChatMessage.session_id == chat_session.id)
-        .order_by(ChatMessage.created_at.asc())
-    )
-    history_messages = history_result.scalars().all()
-
-    history_text = []
-    for message in history_messages:
-        history_text.append(f"User: {message.question}")
-        history_text.append(f"Assistant: {message.answer}")
-
-    answer = await _run_chat_agent_with_retry(
-        "\n".join([
-            "Chat history:",
-            *history_text,
-            "Current question:",
-            question,
-        ]),
-        project_context,
-    )
+    answer = await _run_chat_agent_with_retry(prompt, project_context)
 
     message = ChatMessage(session_id=chat_session.id, question=question, answer=answer.answer)
     session.add(message)
@@ -454,3 +495,146 @@ async def chat_with_project(project_id: int, payload: dict, session: AsyncSessio
         "answer": answer.answer,
         "referenced_files": answer.referenced_files,
     }
+
+
+def _derive_referenced_files(answer_text: str, project_context: ProjectContext, limit: int = 10) -> list[str]:
+    """Cross-reference which of the project's Python files are mentioned by name in
+    the assembled streamed answer, without a second agent call."""
+
+    referenced: list[str] = []
+    for file_path in project_context.python_files:
+        file_name = file_path.rsplit("/", 1)[-1]
+        if file_path in answer_text or file_name in answer_text:
+            referenced.append(file_path)
+            if len(referenced) >= limit:
+                break
+
+    return referenced
+
+
+def _sse_pack(payload: dict[str, Any], event: str | None = None) -> bytes:
+    """Format a payload as one Server-Sent Events frame, JSON-encoding the data line
+    so embedded newlines/quotes in streamed text can't break the SSE framing."""
+
+    prefix = f"event: {event}\n" if event else ""
+    return f"{prefix}data: {json_dumps(payload)}\n\n".encode("utf-8")
+
+
+async def _stream_chat_answer(
+    prompt: str,
+    project_context: ProjectContext,
+    meta: dict[str, Any],
+) -> AsyncIterator[str]:
+    """Yield answer text chunks from the plain-text streaming chat agent.
+
+    Retries on a 429 rate limit as long as no chunk has been sent yet. Any other
+    agent failure before the first chunk degrades to _build_chat_fallback() (its
+    referenced_files are recorded in meta["referenced_files"]). A failure after
+    streaming has already started can't be retried cleanly without duplicating
+    content already shown to the user, so it's recorded in meta["interrupted"] and
+    the generator simply stops.
+    """
+
+    max_attempts = 3
+    stream_started = False
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with chat_agent_stream.run_stream(prompt, deps=project_context) as stream:
+                async for delta in stream.stream_text(delta=True, debounce_by=0.05):
+                    stream_started = True
+                    yield delta
+            return
+        except ModelHTTPError as error:
+            if stream_started:
+                logger.exception("Chat stream interrupted mid-response")
+                meta["interrupted"] = True
+                return
+            if error.status_code == 429 and attempt < max_attempts:
+                retry_delay = _extract_retry_delay_seconds(error) or 6.0
+                await asyncio.sleep(retry_delay)
+                continue
+            logger.exception("Chat model call failed with an HTTP error")
+            break
+        except (UnexpectedModelBehavior, AgentRunError):
+            if stream_started:
+                logger.exception("Chat stream interrupted mid-response")
+                meta["interrupted"] = True
+                return
+            logger.exception("Chat agent misbehaved")
+            break
+        except Exception:
+            if stream_started:
+                logger.exception("Chat stream interrupted mid-response")
+                meta["interrupted"] = True
+                return
+            logger.exception("Unexpected error during chat streaming")
+            break
+
+    fallback = _build_chat_fallback(project_context, prompt)
+    meta["referenced_files"] = fallback.referenced_files
+    yield fallback.answer
+
+
+async def _chat_sse_event_stream(
+    session: AsyncSession,
+    chat_session: ChatSession,
+    question: str,
+    prompt: str,
+    project_context: ProjectContext,
+) -> AsyncIterator[bytes]:
+    """Drive _stream_chat_answer, forward each chunk as an SSE frame, then persist
+    the full assembled answer once the stream completes."""
+
+    meta: dict[str, Any] = {}
+    answer_parts: list[str] = []
+
+    async for delta in _stream_chat_answer(prompt, project_context, meta):
+        answer_parts.append(delta)
+        yield _sse_pack({"chunk": delta})
+
+    full_answer = "".join(answer_parts)
+
+    if meta.get("interrupted"):
+        yield _sse_pack(
+            {"message": "The response was interrupted. Please try again."},
+            event="error",
+        )
+
+    if "referenced_files" in meta:
+        referenced_files = meta["referenced_files"]
+    else:
+        referenced_files = _derive_referenced_files(full_answer, project_context)
+
+    yield _sse_pack({"referenced_files": referenced_files}, event="done")
+
+    if full_answer:
+        message = ChatMessage(session_id=chat_session.id, question=question, answer=full_answer)
+        session.add(message)
+        await session.commit()
+
+
+@router.post("/chat/{project_id}/stream")
+async def chat_with_project_stream(project_id: int, payload: dict, session: AsyncSession = Depends(get_session)):
+    """Stream a chat answer via SSE as it's generated, then persist it once complete.
+
+    This is async because it performs database I/O and model calls.
+    """
+
+    question = (payload.get("question") or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required")
+
+    project = await _load_project(session, project_id)
+    project_root = _project_extract_path(project.id)
+    if not project_root.exists():
+        raise HTTPException(status_code=404, detail="Extracted project not found")
+
+    project_context = build_project_context(project.project_name, project_root)
+    chat_session = await _get_or_create_chat_session(session, project.id)
+    prompt = await _build_chat_prompt(session, chat_session, question)
+
+    return StreamingResponse(
+        _chat_sse_event_stream(session, chat_session, question, prompt, project_context),
+        media_type="text/event-stream",
+    )
