@@ -25,6 +25,13 @@ def get_sessionmaker():
     return async_sessionmaker(get_engine(), expire_on_commit=False)
 
 
+async def init_db():
+    """Create database tables for the existing SQLAlchemy metadata."""
+
+    async with get_engine().begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
 class Project(Base):
     __tablename__ = "projects"
 

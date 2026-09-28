@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from app.config import settings
-from app.database import get_engine
+from app.database import get_engine, init_db
 from app.routes import router
 
 
@@ -20,6 +20,7 @@ async def validate_startup_environment() -> None:
 
 	settings.validate_required()
 	get_engine()
+	await init_db()
 	print("DATABASE_URL loaded successfully")
 	print("GEMINI_API_KEY loaded successfully")
 	print(f"Gemini model loaded: {settings.MODEL_NAME}")
