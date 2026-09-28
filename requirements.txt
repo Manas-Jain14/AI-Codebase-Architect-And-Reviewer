@@ -3,6 +3,7 @@ uvicorn
 SQLAlchemy[asyncio]
 greenlet
 asyncpg
+psycopg[binary]
 alembic
 pydantic
 pydantic-ai
