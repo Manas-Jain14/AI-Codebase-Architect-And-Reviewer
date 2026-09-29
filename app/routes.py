@@ -151,7 +151,7 @@ async def _get_or_create_chat_session(session: AsyncSession, project_id: int) ->
 
 
 async def _run_chat_agent_with_retry(prompt: str, project_context: ProjectContext) -> ChatAnswer:
-    """Run the chat agent and retry if Gemini rate-limits the request.
+    """Run the chat agent and retry transient Gemini HTTP errors.
 
     Any other agent failure (a non-429 HTTP error, the model producing output that
     fails validation, or anything else unexpected) degrades to _build_chat_fallback()
@@ -170,10 +170,11 @@ async def _run_chat_agent_with_retry(prompt: str, project_context: ProjectContex
             )
             return result.output
         except ModelHTTPError as error:
-            if error.status_code == 429 and attempt < max_attempts:
-                retry_delay = _extract_retry_delay_seconds(error) or 6.0
-                await asyncio.sleep(retry_delay)
-                continue
+            if error.status_code in {429, 500, 502, 503, 504}:
+                if attempt < max_attempts:
+                    retry_delay = _extract_retry_delay_seconds(error)
+                    await asyncio.sleep(min(retry_delay or 2 ** (attempt - 1), 8.0))
+                    continue
             logger.exception("Chat model call failed with an HTTP error")
             return _build_chat_fallback(project_context, prompt)
         except (UnexpectedModelBehavior, AgentRunError):
@@ -384,11 +385,26 @@ async def analyze_project(project_id: int, session: AsyncSession = Depends(get_s
     try:
         async with _temporary_project_context(project) as project_root:
             project_context = build_project_context(project.project_name, project_root)
-            result = await architect_agent.run(
-                "Produce a structured architecture review from the provided ProjectContext.",
-                deps=project_context,
-                output_type=ArchitectureReview,
-            )
+            transient_statuses = {429, 500, 502, 503, 504}
+            for attempt in range(1, 4):
+                try:
+                    result = await architect_agent.run(
+                        "Produce a structured architecture review from the provided ProjectContext.",
+                        deps=project_context,
+                        output_type=ArchitectureReview,
+                    )
+                    break
+                except ModelHTTPError as error:
+                    if error.status_code not in transient_statuses:
+                        raise
+                    if attempt == 3:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Gemini is temporarily unavailable. Please retry the analysis later.",
+                        ) from error
+
+                    retry_delay = _extract_retry_delay_seconds(error)
+                    await asyncio.sleep(min(retry_delay or 2 ** (attempt - 1), 8.0))
             review = result.output
 
             report = AnalysisReport(
@@ -621,20 +637,22 @@ async def _stream_chat_answer(
 ) -> AsyncIterator[str]:
     """Yield answer text chunks from the plain-text streaming chat agent.
 
-    Retries on a 429 rate limit as long as no chunk has been sent yet. Any other
-    agent failure before the first chunk degrades to _build_chat_fallback() (its
-    referenced_files are recorded in meta["referenced_files"]). A failure after
-    streaming has already started can't be retried cleanly without duplicating
-    content already shown to the user, so it's recorded in meta["interrupted"] and
-    the generator simply stops.
+    Retries transient Gemini HTTP errors only when the upstream stream fails to
+    establish. Any agent failure before the first chunk degrades to
+    _build_chat_fallback() (its referenced_files are recorded in
+    meta["referenced_files"]). A failure after streaming has already started can't
+    be retried cleanly without duplicating content already shown to the user, so
+    it's recorded in meta["interrupted"] and the generator simply stops.
     """
 
     max_attempts = 3
     stream_started = False
 
     for attempt in range(1, max_attempts + 1):
+        stream_established = False
         try:
             async with chat_agent_stream.run_stream(prompt, deps=project_context) as stream:
+                stream_established = True
                 async for delta in stream.stream_text(delta=True, debounce_by=0.05):
                     stream_started = True
                     yield delta
@@ -644,10 +662,11 @@ async def _stream_chat_answer(
                 logger.exception("Chat stream interrupted mid-response")
                 meta["interrupted"] = True
                 return
-            if error.status_code == 429 and attempt < max_attempts:
-                retry_delay = _extract_retry_delay_seconds(error) or 6.0
-                await asyncio.sleep(retry_delay)
-                continue
+            if error.status_code in {429, 500, 502, 503, 504} and not stream_established:
+                if attempt < max_attempts:
+                    retry_delay = _extract_retry_delay_seconds(error)
+                    await asyncio.sleep(min(retry_delay or 2 ** (attempt - 1), 8.0))
+                    continue
             logger.exception("Chat model call failed with an HTTP error")
             break
         except (UnexpectedModelBehavior, AgentRunError):
