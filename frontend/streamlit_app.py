@@ -113,8 +113,10 @@ if "messages" not in st.session_state:
 sidebar_projects = []
 try:
     sidebar_projects = fetch_projects()
-except Exception:
-    st.sidebar.warning("Backend is not reachable yet.")
+except Exception as error:
+    st.sidebar.error(
+        f"Backend is not reachable yet. BACKEND_URL={BACKEND_URL!r}. Error: {error}"
+    )
 
 st.sidebar.header("📂 Project List")
 project_labels = [f"{project['id']}: {_clean_project_label(project['project_name'])}" for project in sidebar_projects]
