@@ -12,3 +12,4 @@ python-dotenv
 streamlit
 requests
 python-multipart
+supabase

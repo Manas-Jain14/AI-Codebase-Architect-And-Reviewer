@@ -5,6 +5,8 @@ import difflib
 import logging
 import re
 import shutil
+import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -33,6 +35,7 @@ from app.diagrams import (
     generate_mermaid_function_flow,
 )
 from app.schemas import ArchitectureReview, ChatAnswer, ProjectContext
+from app.storage import delete_file, download_file, upload_file
 from app.utils import build_project_context, extract_zip_safely, json_dumps, json_loads
 
 
@@ -42,6 +45,28 @@ logger = logging.getLogger(__name__)
 
 def _project_extract_path(project_id: int) -> Path:
     return Path(EXTRACT_DIR) / str(project_id)
+
+
+@asynccontextmanager
+async def _temporary_project_context(project: Project) -> AsyncIterator[Path]:
+    with tempfile.TemporaryDirectory(prefix=f"project-{project.id}-") as temp_dir:
+        temp_path = Path(temp_dir)
+        zip_path = temp_path / "project.zip"
+        extract_path = temp_path / "extracted"
+
+        try:
+            download_file(project.zip_path, str(zip_path))
+        except Exception:
+            raise RuntimeError(
+                f"Failed to download ZIP for project {project.id} from Supabase Storage"
+            ) from None
+
+        try:
+            extract_zip_safely(zip_path, extract_path)
+        except Exception:
+            raise RuntimeError(f"Failed to extract ZIP for project {project.id}") from None
+
+        yield extract_path
 
 
 async def _load_project(session: AsyncSession, project_id: int) -> Project:
@@ -243,21 +268,42 @@ async def upload_project(file: UploadFile = File(...), session: AsyncSession = D
     if not file.filename:
         raise HTTPException(status_code=400, detail="ZIP file is required")
 
+    safe_filename = Path(file.filename).name
+    if not safe_filename:
+        raise HTTPException(status_code=400, detail="ZIP filename is invalid")
+
     Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
     Path(EXTRACT_DIR).mkdir(parents=True, exist_ok=True)
 
-    upload_path = Path(UPLOAD_DIR) / file.filename
-    with upload_path.open("wb") as handle:
-        shutil.copyfileobj(file.file, handle)
-
     next_id = await _next_available_project_id(session)
-    project = Project(id=next_id, project_name=Path(file.filename).stem, zip_path=str(upload_path))
+    object_key = f"projects/{next_id}/{safe_filename}"
+    upload_path = Path(UPLOAD_DIR) / safe_filename
+    project = Project(id=next_id, project_name=Path(safe_filename).stem, zip_path=object_key)
     session.add(project)
-    await session.commit()
-    await session.refresh(project)
+
+    try:
+        await session.flush()
+        with upload_path.open("wb") as handle:
+            shutil.copyfileobj(file.file, handle)
+        upload_file(str(upload_path), object_key)
+        await session.commit()
+        await session.refresh(project)
+    except Exception:
+        await session.rollback()
+        try:
+            upload_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove temporary project ZIP %s", upload_path, exc_info=True)
+        raise
 
     project_extract_dir = _project_extract_path(project.id)
-    extract_zip_safely(upload_path, project_extract_dir)
+    try:
+        extract_zip_safely(upload_path, project_extract_dir)
+    finally:
+        try:
+            upload_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove temporary project ZIP %s", upload_path, exc_info=True)
 
     return {"project_id": project.id}
 
@@ -286,19 +332,22 @@ async def delete_project(project_id: int, session: AsyncSession = Depends(get_se
 
     project = await _load_project(session, project_id)
 
+    try:
+        delete_file(project.zip_path)
+    except Exception as exc:
+        await session.rollback()
+        logger.exception("Failed to delete ZIP object for project %s", project_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to delete project ZIP from Supabase Storage",
+        ) from exc
+
     session_ids_subquery = select(ChatSession.id).where(ChatSession.project_id == project_id).scalar_subquery()
     await session.execute(delete(ChatMessage).where(ChatMessage.session_id.in_(session_ids_subquery)))
     await session.execute(delete(ChatSession).where(ChatSession.project_id == project_id))
     await session.execute(delete(AnalysisReport).where(AnalysisReport.project_id == project_id))
     await session.execute(delete(Project).where(Project.id == project_id))
     await session.commit()
-
-    zip_path = Path(project.zip_path)
-    if zip_path.exists():
-        try:
-            zip_path.unlink()
-        except OSError:
-            logger.exception("Failed to delete zip file %s for project %s", zip_path, project_id)
 
     extract_path = _project_extract_path(project_id)
     if extract_path.exists():
@@ -332,42 +381,51 @@ async def analyze_project(project_id: int, session: AsyncSession = Depends(get_s
     """
 
     project = await _load_project(session, project_id)
-    project_root = _project_extract_path(project.id)
-    if not project_root.exists():
-        raise HTTPException(status_code=404, detail="Extracted project not found")
+    try:
+        async with _temporary_project_context(project) as project_root:
+            project_context = build_project_context(project.project_name, project_root)
+            result = await architect_agent.run(
+                "Produce a structured architecture review from the provided ProjectContext.",
+                deps=project_context,
+                output_type=ArchitectureReview,
+            )
+            review = result.output
 
-    project_context = build_project_context(project.project_name, project_root)
-    result = await architect_agent.run(
-        "Produce a structured architecture review from the provided ProjectContext.",
-        deps=project_context,
-        output_type=ArchitectureReview,
-    )
-    review = result.output
+            report = AnalysisReport(
+                project_id=project.id,
+                summary=review.summary,
+                architecture=review.architecture,
+                strengths=json_dumps(review.strengths),
+                weaknesses=json_dumps(review.weaknesses),
+                score=0.0,  # dummy value only to satisfy the DB's NOT NULL constraint; never read or displayed
+                roadmap=json_dumps(review.roadmap),
+            )
+            session.add(report)
+            await session.commit()
+            await session.refresh(report)
 
-    report = AnalysisReport(
-        project_id=project.id,
-        summary=review.summary,
-        architecture=review.architecture,
-        strengths=json_dumps(review.strengths),
-        weaknesses=json_dumps(review.weaknesses),
-        score=0.0,  # dummy value only to satisfy the DB's NOT NULL constraint; never read or displayed
-        roadmap=json_dumps(review.roadmap),
-    )
-    session.add(report)
-    await session.commit()
-    await session.refresh(report)
-
-    return {
-        "id": report.id,
-        "project_id": report.project_id,
-        "summary": report.summary,
-        "architecture": report.architecture,
-        "strengths": review.strengths,
-        "weaknesses": review.weaknesses,
-        "roadmap": review.roadmap,
-        "scalability": review.scalability,
-        "recruiter_evaluation": review.recruiter_evaluation,
-    }
+            return {
+                "id": report.id,
+                "project_id": report.project_id,
+                "summary": report.summary,
+                "architecture": report.architecture,
+                "strengths": review.strengths,
+                "weaknesses": review.weaknesses,
+                "roadmap": review.roadmap,
+                "scalability": review.scalability,
+                "recruiter_evaluation": review.recruiter_evaluation,
+            }
+    except RuntimeError as exc:
+        restore_error_prefixes = (
+            f"Failed to download ZIP for project {project.id}",
+            f"Failed to extract ZIP for project {project.id}",
+        )
+        if not str(exc).startswith(restore_error_prefixes):
+            raise
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to restore project files from Supabase Storage",
+        ) from exc
 
 
 @router.get("/report/{project_id}")
@@ -401,36 +459,45 @@ async def get_architecture(project_id: int, session: AsyncSession = Depends(get_
     """
 
     project = await _load_project(session, project_id)
-    project_root = _project_extract_path(project.id)
-    if not project_root.exists():
-        raise HTTPException(status_code=404, detail="Extracted project not found")
+    try:
+        async with _temporary_project_context(project) as project_root:
+            project_context = build_project_context(project.project_name, project_root)
 
-    project_context = build_project_context(project.project_name, project_root)
-
-    return {
-        "project_name": project_context.project_name,
-        "project_metrics": {
-            "total_files": project_context.total_files,
-            "total_folders": project_context.total_folders,
-            "python_files": len(project_context.python_files),
-            "classes": len(project_context.classes),
-            "functions": len(project_context.functions),
-            "api_routes": len(project_context.api_routes),
-        },
-        "dependency_graph": generate_dependency_graph(project_context),
-        "function_graph": generate_function_graph(project_context),
-        "execution_flow": generate_execution_flow(project_context),
-        "database_flow": generate_database_flow(project_context),
-        "critical_files": identify_critical_files(project_context),
-        "mermaid_architecture": generate_mermaid_architecture(project_context),
-        "mermaid_function_flow": generate_mermaid_function_flow(project_context),
-        "mermaid_database_flow": generate_mermaid_database_flow(project_context),
-        "mermaid_execution_flow": generate_mermaid_execution_flow(project_context),
-        "python_files": project_context.python_files,
-        "functions": project_context.functions,
-        "classes": project_context.classes,
-        "api_routes": project_context.api_routes,
-    }
+            return {
+                "project_name": project_context.project_name,
+                "project_metrics": {
+                    "total_files": project_context.total_files,
+                    "total_folders": project_context.total_folders,
+                    "python_files": len(project_context.python_files),
+                    "classes": len(project_context.classes),
+                    "functions": len(project_context.functions),
+                    "api_routes": len(project_context.api_routes),
+                },
+                "dependency_graph": generate_dependency_graph(project_context),
+                "function_graph": generate_function_graph(project_context),
+                "execution_flow": generate_execution_flow(project_context),
+                "database_flow": generate_database_flow(project_context),
+                "critical_files": identify_critical_files(project_context),
+                "mermaid_architecture": generate_mermaid_architecture(project_context),
+                "mermaid_function_flow": generate_mermaid_function_flow(project_context),
+                "mermaid_database_flow": generate_mermaid_database_flow(project_context),
+                "mermaid_execution_flow": generate_mermaid_execution_flow(project_context),
+                "python_files": project_context.python_files,
+                "functions": project_context.functions,
+                "classes": project_context.classes,
+                "api_routes": project_context.api_routes,
+            }
+    except RuntimeError as exc:
+        restore_error_prefixes = (
+            f"Failed to download ZIP for project {project.id}",
+            f"Failed to extract ZIP for project {project.id}",
+        )
+        if not str(exc).startswith(restore_error_prefixes):
+            raise
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to restore project files from Supabase Storage",
+        ) from exc
 
 
 @router.get("/architecture/{project_id}/file/{file_path:path}")
@@ -441,12 +508,21 @@ async def get_architecture_file(project_id: int, file_path: str, session: AsyncS
     """
 
     project = await _load_project(session, project_id)
-    project_root = _project_extract_path(project.id)
-    if not project_root.exists():
-        raise HTTPException(status_code=404, detail="Extracted project not found")
-
-    project_context = build_project_context(project.project_name, project_root)
-    return get_file_details(project_context, file_path)
+    try:
+        async with _temporary_project_context(project) as project_root:
+            project_context = build_project_context(project.project_name, project_root)
+            return get_file_details(project_context, file_path)
+    except RuntimeError as exc:
+        restore_error_prefixes = (
+            f"Failed to download ZIP for project {project.id}",
+            f"Failed to extract ZIP for project {project.id}",
+        )
+        if not str(exc).startswith(restore_error_prefixes):
+            raise
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to restore project files from Supabase Storage",
+        ) from exc
 
 
 @router.get("/architecture/{project_id}/function/{function_name}")
@@ -457,12 +533,21 @@ async def get_architecture_function(project_id: int, function_name: str, session
     """
 
     project = await _load_project(session, project_id)
-    project_root = _project_extract_path(project.id)
-    if not project_root.exists():
-        raise HTTPException(status_code=404, detail="Extracted project not found")
-
-    project_context = build_project_context(project.project_name, project_root)
-    return get_function_details(project_context, function_name)
+    try:
+        async with _temporary_project_context(project) as project_root:
+            project_context = build_project_context(project.project_name, project_root)
+            return get_function_details(project_context, function_name)
+    except RuntimeError as exc:
+        restore_error_prefixes = (
+            f"Failed to download ZIP for project {project.id}",
+            f"Failed to extract ZIP for project {project.id}",
+        )
+        if not str(exc).startswith(restore_error_prefixes):
+            raise
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to restore project files from Supabase Storage",
+        ) from exc
 
 
 @router.post("/chat/{project_id}")
@@ -477,24 +562,33 @@ async def chat_with_project(project_id: int, payload: dict, session: AsyncSessio
         raise HTTPException(status_code=400, detail="question is required")
 
     project = await _load_project(session, project_id)
-    project_root = _project_extract_path(project.id)
-    if not project_root.exists():
-        raise HTTPException(status_code=404, detail="Extracted project not found")
+    try:
+        async with _temporary_project_context(project) as project_root:
+            project_context = build_project_context(project.project_name, project_root)
+            chat_session = await _get_or_create_chat_session(session, project.id)
+            prompt = await _build_chat_prompt(session, chat_session, question)
 
-    project_context = build_project_context(project.project_name, project_root)
-    chat_session = await _get_or_create_chat_session(session, project.id)
-    prompt = await _build_chat_prompt(session, chat_session, question)
+            answer = await _run_chat_agent_with_retry(prompt, project_context)
 
-    answer = await _run_chat_agent_with_retry(prompt, project_context)
+            message = ChatMessage(session_id=chat_session.id, question=question, answer=answer.answer)
+            session.add(message)
+            await session.commit()
 
-    message = ChatMessage(session_id=chat_session.id, question=question, answer=answer.answer)
-    session.add(message)
-    await session.commit()
-
-    return {
-        "answer": answer.answer,
-        "referenced_files": answer.referenced_files,
-    }
+            return {
+                "answer": answer.answer,
+                "referenced_files": answer.referenced_files,
+            }
+    except RuntimeError as exc:
+        restore_error_prefixes = (
+            f"Failed to download ZIP for project {project.id}",
+            f"Failed to extract ZIP for project {project.id}",
+        )
+        if not str(exc).startswith(restore_error_prefixes):
+            raise
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to restore project files from Supabase Storage",
+        ) from exc
 
 
 def _derive_referenced_files(answer_text: str, project_context: ProjectContext, limit: int = 10) -> list[str]:
@@ -626,15 +720,24 @@ async def chat_with_project_stream(project_id: int, payload: dict, session: Asyn
         raise HTTPException(status_code=400, detail="question is required")
 
     project = await _load_project(session, project_id)
-    project_root = _project_extract_path(project.id)
-    if not project_root.exists():
-        raise HTTPException(status_code=404, detail="Extracted project not found")
+    try:
+        async with _temporary_project_context(project) as project_root:
+            project_context = build_project_context(project.project_name, project_root)
+            chat_session = await _get_or_create_chat_session(session, project.id)
+            prompt = await _build_chat_prompt(session, chat_session, question)
 
-    project_context = build_project_context(project.project_name, project_root)
-    chat_session = await _get_or_create_chat_session(session, project.id)
-    prompt = await _build_chat_prompt(session, chat_session, question)
-
-    return StreamingResponse(
-        _chat_sse_event_stream(session, chat_session, question, prompt, project_context),
-        media_type="text/event-stream",
-    )
+            return StreamingResponse(
+                _chat_sse_event_stream(session, chat_session, question, prompt, project_context),
+                media_type="text/event-stream",
+            )
+    except RuntimeError as exc:
+        restore_error_prefixes = (
+            f"Failed to download ZIP for project {project.id}",
+            f"Failed to extract ZIP for project {project.id}",
+        )
+        if not str(exc).startswith(restore_error_prefixes):
+            raise
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to restore project files from Supabase Storage",
+        ) from exc
