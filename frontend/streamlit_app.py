@@ -4,40 +4,55 @@ import html
 import json
 import os
 import re
-from pathlib import Path
 from typing import Iterator
 
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
+from frontend.http_client import format_request_error, get_with_retries, upload_zip
+
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
 
 def fetch_projects() -> list[dict]:
-    response = requests.get(f"{BACKEND_URL}/projects", timeout=30)
-    response.raise_for_status()
-    return response.json()
+    response = get_with_retries(f"{BACKEND_URL}/projects", timeout=30)
+    projects = response.json()
+    if not isinstance(projects, list) or any(
+        not isinstance(project, dict)
+        or not isinstance(project.get("id"), int)
+        or not isinstance(project.get("project_name"), str)
+        for project in projects
+    ):
+        raise ValueError("Backend returned an invalid project list.")
+    return projects
 
 
 def fetch_report(project_id: int) -> dict | None:
-    response = requests.get(f"{BACKEND_URL}/report/{project_id}", timeout=60)
+    response = get_with_retries(
+        f"{BACKEND_URL}/report/{project_id}",
+        timeout=60,
+        allowed_statuses=frozenset({404}),
+    )
     if response.status_code == 404:
         return None
-    response.raise_for_status()
     return response.json()
 
 
 def fetch_architecture(project_id: int) -> dict | None:
-    response = requests.get(f"{BACKEND_URL}/architecture/{project_id}", timeout=60)
+    response = get_with_retries(
+        f"{BACKEND_URL}/architecture/{project_id}",
+        timeout=60,
+        allowed_statuses=frozenset({404}),
+    )
     if response.status_code == 404:
         return None
-    response.raise_for_status()
     return response.json()
 
 
 def trigger_analysis(project_id: int) -> dict:
+    # This GET triggers persistent analysis, so retrying it could create duplicate reports.
     response = requests.get(f"{BACKEND_URL}/analysis/{project_id}", timeout=300)
     response.raise_for_status()
     return response.json()
@@ -85,14 +100,6 @@ def stream_chat(project_id: int, question: str, result: dict) -> Iterator[str]:
             yield payload["chunk"]
 
 
-def upload_zip(file_path: Path) -> dict:
-    with file_path.open("rb") as handle:
-        files = {"file": (file_path.name, handle.read(), "application/zip")}
-        response = requests.post(f"{BACKEND_URL}/upload-project", files=files, timeout=300)
-    response.raise_for_status()
-    return response.json()
-
-
 def delete_project(project_id: int) -> dict:
     response = requests.delete(f"{BACKEND_URL}/projects/{project_id}", timeout=60)
     response.raise_for_status()
@@ -110,13 +117,29 @@ st.title("🏗️ AI Codebase Architect & Engineering Reviewer")
 if "messages" not in st.session_state:
     st.session_state.messages = {}
 
-sidebar_projects = []
-try:
-    sidebar_projects = fetch_projects()
-except Exception as error:
-    st.sidebar.error(
-        f"Backend is not reachable yet. BACKEND_URL={BACKEND_URL!r}. Error: {error}"
-    )
+if "projects" not in st.session_state:
+    st.session_state.projects = None
+if "architecture_cache" not in st.session_state:
+    st.session_state.architecture_cache = {}
+if "report_cache" not in st.session_state:
+    st.session_state.report_cache = {}
+if "upload_in_progress" not in st.session_state:
+    st.session_state.upload_in_progress = False
+
+if st.sidebar.button("↻ Refresh projects"):
+    st.session_state.projects = None
+
+if st.session_state.projects is None:
+    try:
+        st.session_state.projects = fetch_projects()
+    except requests.exceptions.HTTPError as error:
+        st.sidebar.error(format_request_error("Could not load projects", error))
+    except requests.exceptions.RequestException as error:
+        st.sidebar.error(format_request_error("Could not reach the backend", error))
+    except Exception as error:
+        st.sidebar.error(format_request_error("Could not load projects", error))
+
+sidebar_projects = st.session_state.projects or []
 
 st.sidebar.header("📂 Project List")
 project_labels = [f"{project['id']}: {_clean_project_label(project['project_name'])}" for project in sidebar_projects]
@@ -141,10 +164,13 @@ if selected_project is not None:
                 try:
                     delete_project(selected_project["id"])
                     st.session_state.messages.pop(selected_project["id"], None)
+                    st.session_state.architecture_cache.pop(selected_project["id"], None)
+                    st.session_state.report_cache.pop(selected_project["id"], None)
+                    st.session_state.projects = None
                     st.session_state.pop(delete_confirm_key, None)
                     st.rerun()
                 except Exception as e:
-                    st.sidebar.error(f"Delete failed: {e}")
+                    st.sidebar.error(format_request_error("Delete failed", e))
         with cancel_col:
             if st.button("❌ Cancel", key=f"cancel_delete_btn_{selected_project['id']}"):
                 st.session_state.pop(delete_confirm_key, None)
@@ -155,24 +181,40 @@ tab_analysis, tab_architect, tab_report, tab_chat, tab_upload = st.tabs([
     "🏗️ Architecture Explorer",
     "📋 Stored Report",
     "💬 Chat With Codebase",
-    "📦 Upload ZIP"
-])
+    "📦 Upload ZIP",
+], on_change="rerun", key="main_tabs")
 
 with tab_upload:
     st.subheader("Upload a Project")
+    if st.session_state.get("upload_success_project_id") is not None:
+        st.success(f"✅ Project uploaded with ID {st.session_state.pop('upload_success_project_id')}")
+
     uploaded_file = st.file_uploader("Upload a ZIP project", type=["zip"])
-    if uploaded_file and st.button("📤 Send ZIP to Backend"):
+    if uploaded_file and st.button(
+        "📤 Send ZIP to Backend",
+        disabled=st.session_state.upload_in_progress,
+    ):
+        st.session_state.upload_in_progress = True
+        upload_succeeded = False
         try:
-            response = requests.post(
+            result = upload_zip(
                 f"{BACKEND_URL}/upload-project",
-                files={"file": (uploaded_file.name, uploaded_file.getvalue(), "application/zip")},
-                timeout=300,
+                uploaded_file.name,
+                uploaded_file.getvalue(),
             )
-            response.raise_for_status()
-            result = response.json()
-            st.success(f"✅ Project uploaded with ID {result['project_id']}")
+            st.session_state.projects = None
+            st.session_state.upload_success_project_id = result["project_id"]
+            upload_succeeded = True
+        except requests.exceptions.HTTPError as e:
+            st.error(format_request_error("Upload failed", e))
+        except requests.exceptions.RequestException as e:
+            st.error(format_request_error("Upload failed", e))
         except Exception as e:
-            st.error(f"Upload failed: {e}")
+            st.error(format_request_error("Upload failed", e))
+        finally:
+            st.session_state.upload_in_progress = False
+        if upload_succeeded:
+            st.rerun()
 
 with tab_analysis:
     if selected_project is None:
@@ -181,9 +223,11 @@ with tab_analysis:
         try:
             with st.spinner("Analyzing..."):
                 analysis = trigger_analysis(selected_project["id"])
+            st.session_state.architecture_cache.pop(selected_project["id"], None)
+            st.session_state.report_cache.pop(selected_project["id"], None)
             st.json(analysis)
         except Exception as e:
-            st.error(f"Analysis failed: {e}")
+            st.error(format_request_error("Analysis failed", e))
 
 with tab_architect:
     def render_mermaid(diagram_code: str, height: int = 750) -> None:
@@ -310,12 +354,17 @@ with tab_architect:
         """
         components.html(component_html, height=height, scrolling=False)
 
-    if selected_project is None:
+    if not tab_architect.open:
+        pass
+    elif selected_project is None:
         st.info("📌 Select a project to explore its architecture.")
     else:
         try:
-            with st.spinner("Loading architecture data..."):
-                arch_data = fetch_architecture(selected_project["id"])
+            project_id = selected_project["id"]
+            if project_id not in st.session_state.architecture_cache:
+                with st.spinner("Loading architecture data..."):
+                    st.session_state.architecture_cache[project_id] = fetch_architecture(project_id)
+            arch_data = st.session_state.architecture_cache[project_id]
             
             if arch_data is None:
                 st.error("Architecture data not available. Run analysis first.")
@@ -370,14 +419,19 @@ with tab_architect:
                     st.info("No diagram available for this selection.")
 
         except Exception as e:
-            st.error(f"Failed to load architecture: {e}")
+            st.error(format_request_error("Failed to load architecture", e))
 
 with tab_report:
-    if selected_project is None:
+    if not tab_report.open:
+        pass
+    elif selected_project is None:
         st.info("📌 Select a project to view a stored report.")
     else:
         try:
-            report = fetch_report(selected_project["id"])
+            project_id = selected_project["id"]
+            if project_id not in st.session_state.report_cache:
+                st.session_state.report_cache[project_id] = fetch_report(project_id)
+            report = st.session_state.report_cache[project_id]
             if report is None:
                 st.info("No stored report yet.")
             else:
@@ -398,7 +452,7 @@ with tab_report:
                     for item in report["roadmap"]:
                         st.write(f"- {item}")
         except Exception as e:
-            st.error(f"Failed to load report: {e}")
+            st.error(format_request_error("Failed to load report", e))
 
 with tab_chat:
     if selected_project is None:
@@ -432,4 +486,3 @@ with tab_chat:
                 st.session_state.messages[project_id].append({"role": "assistant", "content": full_answer})
         except Exception as e:
             st.error(f"Chat failed: {e}")
-
