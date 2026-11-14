@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from frontend import http_client
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "frontend" / "streamlit_app.py"
+sys.path.insert(0, str(APP_PATH.parent))
 PROJECTS = [{"id": 1, "project_name": "sample"}]
 ARCHITECTURE = {
     "project_metrics": {

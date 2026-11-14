@@ -10,7 +10,7 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
-from frontend.http_client import format_request_error, get_with_retries, upload_zip
+from http_client import format_request_error, get_with_retries, upload_zip
 
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
