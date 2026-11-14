@@ -69,6 +69,10 @@ Includes:
 - Display clearer request and backend error messages.
 
 ---
+🌐 Live Demo
+https://ai-codebase-architect-frontend.onrender.com/
+
+Note: The application is hosted on free-tier infrastructure. Initial loading may take some time while the services wake up. Availability is not guaranteed.
 
 ## 🧰 Tech Stack
 
@@ -517,11 +521,6 @@ Swami Keshwanand Institute of Technology, Jaipur
 [AI Codebase Architect & Engineering Reviewer](https://github.com/Manas-Jain14/AI-Codebase-Architect-And-Reviewer)
 
 ---
-
-🌐 Live Demo
-https://ai-codebase-architect-frontend.onrender.com/
-
-Note: The application is hosted on free-tier infrastructure. Initial loading may take some time while the services wake up. Availability is not guaranteed.
 
 
 *Built to explore the intersection of software architecture, static analysis, and Generative AI.*
